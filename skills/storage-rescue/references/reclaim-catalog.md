@@ -77,6 +77,8 @@ mkdir "$D/items" || exit 1
 for REL in "relative/path/one" "relative/path two"; do   # paths relative to $HOME
   case "/$REL/" in //*|*/../*|*/./*) echo "REFUSED: $REL"; continue ;; esac
   mkdir -p "$D/items/$(dirname "$REL")" || { echo "NOT MOVED: $REL"; continue; }
+  # an earlier item may have created this path (for example "a/b" before "a"); mv would then nest inside it
+  if [ -e "$D/items/$REL" ] || [ -L "$D/items/$REL" ]; then echo "NOT MOVED (overlaps an earlier item): $REL"; continue; fi
   mv -n -- "$HOME/$REL" "$D/items/$REL"
   if [ -e "$HOME/$REL" ] || [ -L "$HOME/$REL" ] || { [ ! -e "$D/items/$REL" ] && [ ! -L "$D/items/$REL" ]; }; then
     echo "NOT MOVED: $REL"

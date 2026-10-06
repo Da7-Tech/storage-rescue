@@ -48,7 +48,7 @@ Both modes can run in one session: offload your files, then reclaim caches.
 - Extended attributes, Finder tags, and ACLs are not carried to the drive. The agent checks every source for them first and keeps items on the Mac unless you accept the loss.
 - Official routes first: `brew cleanup`, `npm cache clean`, `xcrun simctl`, in-app "Clear cache" screens.
 - Paths referenced by your shell profile, launch agents, or app configs are kept.
-- Photos, Mail, Messages, Keychains, SSH keys, `.git` folders, credentials, and system folders are never touched.
+- Photos, Mail, Messages, Keychains, SSH keys, credentials, and system folders are protected: the agent leaves them alone unless you make a specific, informed request. A `.git` folder is never deleted on its own; in Offload mode it only moves inside a verified archive of its whole project.
 - No `sudo` from the agent. When a step needs it, you get the exact command to run yourself.
 
 ## Install

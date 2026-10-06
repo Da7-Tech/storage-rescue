@@ -30,8 +30,11 @@ macOS mounts NTFS read-only. Options, in order of preference when the drive alre
 
    ```bash
    brew tap nohajc/anylinuxfs
+   brew trust nohajc/anylinuxfs
    brew install anylinuxfs
    ```
+
+   Recent Homebrew versions refuse to load formulae from a third-party tap until the user trusts it. `brew trust` records that decision; it is the user's call, so explain it and ask before running it, and never disable Homebrew's trust check instead.
 
    Mounting needs raw disk access, so the user runs it in their own Terminal (macOS privacy controls usually block an agent's process from it):
 

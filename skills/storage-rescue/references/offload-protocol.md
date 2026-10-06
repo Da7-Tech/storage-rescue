@@ -79,7 +79,7 @@ The manifest records the source and the final destination, so renamed items stay
 4. `fsync` the temporary file.
 5. Stat the source again. If size, modification time, inode, or ctime changed, delete the temporary file and fail the job.
 6. Hash the temporary file again from the drive with the cache disabled (`fcntl F_NOCACHE` on macOS, value 48).
-7. If the hashes match, rename it to the final name, restore the modification time, and append a manifest line. Otherwise delete it and fail the job.
+7. If the hashes match, move it to the final name with a rename that cannot replace an existing file (`renamex_np` with `RENAME_EXCL`; on file systems without it, such as exFAT, first claim the final name with an exclusive create and replace only that empty claim). If the name was taken in the meantime, use the next ` (n)` name. Then restore the modification time and append a manifest line. If the hashes differ, delete the temporary file and fail the job.
 
 ## 7. Manifest
 
@@ -108,11 +108,13 @@ Long copies outlive an agent's command timeout and can be killed by the host. St
 Adapt the paths and the job list. Keep the checks intact.
 
 ```python
-import fcntl, gzip, hashlib, json, os, secrets, stat, tarfile, time, unicodedata
+import ctypes, errno, fcntl, gzip, hashlib, json, os, secrets, stat, tarfile, time, unicodedata
 from pathlib import Path
 
 CHUNK = 8 * 1024 * 1024
 F_NOCACHE = 48
+RENAME_EXCL = 0x4  # renamex_np flag: fail with EEXIST instead of replacing the destination
+_libc = ctypes.CDLL(None, use_errno=True)
 BAD = {c: "_" for c in '<>:"\\|?*'}
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 VERIFIED = ("verified", "identical-already-present-verified", "archive-verified")
@@ -211,6 +213,41 @@ def drop_temp(part, ident):
     if (st.st_dev, st.st_ino) == ident:
         os.unlink(part)
 
+def publish(part, dst):
+    """Rename part to dst without ever replacing a file this run did not create.
+    Raises FileExistsError if dst is taken."""
+    if _libc.renamex_np(os.fsencode(part), os.fsencode(dst), RENAME_EXCL) == 0:
+        return
+    err = ctypes.get_errno()
+    if err not in (errno.ENOTSUP, errno.EINVAL):
+        raise OSError(err, os.strerror(err), str(dst))
+    # exFAT and some network mounts lack exclusive rename: claim the name exclusively,
+    # then replace only that empty claim
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666)
+    st = os.fstat(fd)
+    os.close(fd)
+    claim = (st.st_dev, st.st_ino)
+    try:
+        cur = os.lstat(dst)
+        if (cur.st_dev, cur.st_ino, cur.st_size) != (*claim, 0):
+            raise IOError(f"destination changed while finishing: {dst}")
+        os.replace(part, dst)
+    except BaseException:
+        drop_temp(dst, claim)
+        raise
+
+def finish(part, dst):
+    """Publish part under dst or, if that name is taken, the next free ' (n)' name. Returns the final path."""
+    wanted = dst
+    for _ in range(1000):
+        dst = unique(wanted)
+        try:
+            publish(part, dst)
+            return dst
+        except FileExistsError:
+            continue
+    raise IOError(f"no free destination name for {wanted}")
+
 def _raise(err):
     raise err
 
@@ -269,9 +306,7 @@ def copy_verified(job, src, dst, root, manifests):
             raise IOError(f"source changed during copy: {src}")
         if part.stat().st_size != st0.st_size or hash_nocache(part) != h.hexdigest():
             raise IOError(f"verification failed: {src}")
-        if dst.exists() or dst.is_symlink():
-            dst = unique(dst)
-        os.replace(part, dst)
+        dst = finish(part, dst)
     except BaseException:
         drop_temp(part, ident)
         raise
@@ -352,16 +387,17 @@ def pack_job(job, src, dest, root, inv, manifests, compress=True):
             reader.close()
         if seen != expected:
             raise IOError(f"archive verification failed: {src}")
-        if dest.exists() or dest.is_symlink():
-            dest = unique(dest)
-        os.replace(part, dest)
+        dest = finish(part, dest)
     except BaseException:
         drop_temp(part, ident)
         raise
+    files = {k: v[2] for k, v in expected.items() if v[0] == "f"}
+    for k, (kind, _size, target) in expected.items():
+        if kind == "h":  # a hard link member carries no data; its content is the verified target's
+            files[k] = files[target]
     record(manifests, {"job": job, "src": str(src), "dest": str(dest), "size": dest.stat().st_size,
                        "sha256": hash_nocache(dest), "status": "archive-verified",
-                       "members": len(expected), "source_bytes": total,
-                       "files": {k: v[2] for k, v in expected.items() if v[0] == "f"}})
+                       "members": len(expected), "source_bytes": total, "files": files})
 
 # ---------- phase 1: copy (deletes nothing)
 
@@ -447,6 +483,11 @@ def _remove(p, is_dir, inside_job):
             os.chmod(os.path.dirname(p), 0o700)
         rm(p)
 
+def _differs_ignoring_ctime(now, recorded):
+    """Compare an entry without its ctime: deleting one name of a hard-linked file changes the
+    other name's ctime, and why_keep() already compared ctime just before deletion."""
+    return now[:4] + now[5:] != list(recorded[:4]) + list(recorded[5:])
+
 def remove_recorded(src, inv):
     """Delete only entries recorded in inv, each re-checked just before removal.
     Folders are removed only when empty, so anything new survives. Returns what was left."""
@@ -460,7 +501,7 @@ def remove_recorded(src, inv):
         try:
             if rel is None or inv[rel][0] == "d":
                 _remove(p, True, rel is not None)
-            elif _entry(p, os.lstat(p)) != inv[rel]:
+            elif _differs_ignoring_ctime(_entry(p, os.lstat(p)), inv[rel]):
                 left.append(f"{rel}: changed")
             else:
                 _remove(p, False, rel != ".")
