@@ -6,7 +6,7 @@ Version 1.0.0. MIT license. Maintained by Da7-Tech.
 
 ## Before and after
 
-One session with the skill on a 1 TB Mac, using both modes:
+A 1 TB Mac before and after the cleanup this skill was written from, carried out by Claude Opus 5.5 in Factory Droid using both modes:
 
 **Before:** 968.39 GB of 994.61 GB used.
 
@@ -108,6 +108,12 @@ assets/                              the before and after screenshots above
 - Offload mode leaves a single copy on the external drive. Keep a second backup of anything irreplaceable.
 - Some steps need you: running a `sudo` command, approving a macOS privacy prompt, or pressing a button inside an app.
 - Sizes from `du` can overstate what deletion frees (APFS clones, purgeable space), so the report uses `df` for before and after.
+
+## Credits
+
+- **The cleanup in the screenshots** was carried out by Claude Opus 5.5 running in [Factory Droid](https://factory.ai).
+- **The skill** was written by Claude Opus 5.5 in Factory Droid, working with Da7-Tech.
+- **Independent review** of the skill: GPT-6 Astra.
 
 ## License
 
