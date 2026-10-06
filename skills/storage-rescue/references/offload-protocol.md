@@ -81,7 +81,7 @@ The manifest records the source and the final destination, so renamed items stay
 6. Hash the temporary file again from the drive with the cache disabled (`fcntl F_NOCACHE` on macOS, value 48).
 7. If the hashes match, move it to the final name with a rename that cannot replace an existing file (`renamex_np` with `RENAME_EXCL`). If the name was taken in the meantime, use the next ` (n)` name. Then restore the modification time and append a manifest line. If the hashes differ, delete the temporary file and fail the job.
 
-File systems without exclusive rename (exFAT) skip the temporary file: the final file is created exclusively under its own name and written directly, so nothing is ever replaced. If such a run is interrupted, a partial file can remain under a final name. It has no `verified` record in the manifest; list such files for the user rather than trusting them.
+File systems without exclusive rename (exFAT) skip the temporary file: the final file is created exclusively under its own name and written directly, so nothing is ever replaced. If such a copy fails, the file is not deleted automatically, because another process could have written to it; it is recorded as `unverified-leftover`. If the run is interrupted, a partial file can also remain under a final name without any record. Neither has a `verified` record in the manifest; list such files for the user rather than trusting or deleting them.
 
 ## 7. Manifest
 
@@ -96,6 +96,7 @@ One JSON object per line (JSONL), appended and fsynced per record, written both 
 | `reverified` / `reverify-failed` | Result of the re-verification phase for one destination |
 | `source-deleted` / `source-kept` | Result of the delete phase for one job, with the reason when kept |
 | `source-partly-deleted` | Verified entries were deleted, but entries that changed or appeared after verification were left in place (listed in `left`) |
+| `unverified-leftover` | On a file system without exclusive rename, a directly written file whose copy failed. It was not deleted automatically; show it to the user |
 
 Use one manifest per archive root. Later batches append to the same file; jobs that already have a `job-copied` record are skipped.
 
@@ -275,6 +276,19 @@ def finish(part, dst):
             continue
     raise IOError(f"no free destination name for {wanted}")
 
+def give_up(job, path, ident, direct, manifests):
+    """Clean up after a failed copy. A random temporary name is deleted if it is still ours.
+    A final name written directly is never deleted, because another process could have written to it;
+    it is recorded so the user can review it."""
+    if not direct:
+        drop_temp(path, ident)
+        return
+    print("UNVERIFIED FILE LEFT ON THE DRIVE", path, flush=True)
+    try:
+        record(manifests, {"job": job, "dest": str(path), "status": "unverified-leftover"})
+    except OSError:
+        pass
+
 def _raise(err):
     raise err
 
@@ -328,6 +342,8 @@ def copy_verified(job, src, dst, root, manifests):
                     break
                 h.update(b); fo.write(b)
             fo.flush(); os.fsync(fo.fileno())
+            st = os.fstat(fo.fileno())
+            ident = (st.st_dev, st.st_ino)  # FAT32 assigns the inode number once data is written
         st1 = os.lstat(src)
         if _entry(src, st1) != _entry(src, st0):
             raise IOError(f"source changed during copy: {src}")
@@ -335,7 +351,7 @@ def copy_verified(job, src, dst, root, manifests):
             raise IOError(f"verification failed: {src}")
         dst = part if direct else finish(part, dst)
     except BaseException:
-        drop_temp(part, ident)
+        give_up(job, part, ident, direct, manifests)
         raise
     os.utime(dst, ns=(st0.st_atime_ns, st0.st_mtime_ns))
     record(manifests, {"job": job, "src": str(src), "dest": str(dst), "size": st0.st_size,
@@ -394,6 +410,8 @@ def pack_job(job, src, dest, root, inv, manifests, compress=True):
                     else:
                         tar.addfile(ti); expected[arc] = (_kind(ti), 0, ti.linkname)
             out.flush(); os.fsync(out.fileno())
+            st = os.fstat(out.fileno())
+            ident = (st.st_dev, st.st_ino)  # FAT32 assigns the inode number once data is written
         seen = {}
         reader = _NoCache(part)
         try:
@@ -416,7 +434,7 @@ def pack_job(job, src, dest, root, inv, manifests, compress=True):
             raise IOError(f"archive verification failed: {src}")
         dest = part if direct else finish(part, dest)
     except BaseException:
-        drop_temp(part, ident)
+        give_up(job, part, ident, direct, manifests)
         raise
     files = {k: v[2] for k, v in expected.items() if v[0] == "f"}
     for k, (kind, _size, target) in expected.items():
@@ -583,7 +601,7 @@ Notes:
 
 ## 10. After the run
 
-1. **No sources left.** Every `job-copied` job has a `source-deleted`, `source-partly-deleted`, or `source-kept` record. Report kept and partly deleted jobs to the user.
+1. **No sources left.** Every `job-copied` job has a `source-deleted`, `source-partly-deleted`, or `source-kept` record. Report kept and partly deleted jobs to the user, and any `unverified-leftover` files on the drive.
 2. **Metadata cleanup.** On NTFS, exFAT, and FAT32 drives, macOS may write `._name` AppleDouble files while copying. See `external-drives.md` for the safe procedure, which deletes only files proven to be generated during the run.
 3. **README and logs.** Update the drive README with this batch, and copy the run logs and plan into `Transfer-Logs/`.
 4. **Measure.** `df -h /System/Volumes/Data` before and after.
