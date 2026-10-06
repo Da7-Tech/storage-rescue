@@ -79,7 +79,9 @@ The manifest records the source and the final destination, so renamed items stay
 4. `fsync` the temporary file.
 5. Stat the source again. If size, modification time, inode, or ctime changed, delete the temporary file and fail the job.
 6. Hash the temporary file again from the drive with the cache disabled (`fcntl F_NOCACHE` on macOS, value 48).
-7. If the hashes match, move it to the final name with a rename that cannot replace an existing file (`renamex_np` with `RENAME_EXCL`; on file systems without it, such as exFAT, first claim the final name with an exclusive create and replace only that empty claim). If the name was taken in the meantime, use the next ` (n)` name. Then restore the modification time and append a manifest line. If the hashes differ, delete the temporary file and fail the job.
+7. If the hashes match, move it to the final name with a rename that cannot replace an existing file (`renamex_np` with `RENAME_EXCL`). If the name was taken in the meantime, use the next ` (n)` name. Then restore the modification time and append a manifest line. If the hashes differ, delete the temporary file and fail the job.
+
+File systems without exclusive rename (exFAT) skip the temporary file: the final file is created exclusively under its own name and written directly, so nothing is ever replaced. If such a run is interrupted, a partial file can remain under a final name. It has no `verified` record in the manifest; list such files for the user rather than trusting them.
 
 ## 7. Manifest
 
@@ -213,28 +215,53 @@ def drop_temp(part, ident):
     if (st.st_dev, st.st_ino) == ident:
         os.unlink(part)
 
+_excl_rename = {}
+
+def has_excl_rename(folder):
+    """Probe once per file system whether renamex_np(RENAME_EXCL) works there (exFAT: no)."""
+    dev = os.stat(folder).st_dev
+    if dev not in _excl_rename:
+        a, fo, ident = create_temp(Path(folder) / ".sr-probe")
+        fo.close()
+        b = Path(folder) / f".sr-probe-{secrets.token_hex(6)}.part"
+        ok = _libc.renamex_np(os.fsencode(a), os.fsencode(b), RENAME_EXCL) == 0
+        err = ctypes.get_errno()
+        if ok:
+            os.unlink(b)  # created by our own exclusive rename
+        else:
+            drop_temp(a, ident)
+            if err not in (errno.ENOTSUP, errno.EINVAL):
+                raise OSError(err, os.strerror(err), str(folder))
+        _excl_rename[dev] = ok
+    return _excl_rename[dev]
+
+def create_final(dst):
+    """Create the final file itself exclusively, at dst or the next free ' (n)' name."""
+    wanted = dst
+    for _ in range(1000):
+        dst = unique(wanted)
+        try:
+            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666)
+        except FileExistsError:
+            continue
+        st = os.fstat(fd)
+        return dst, os.fdopen(fd, "wb"), (st.st_dev, st.st_ino)
+    raise IOError(f"no free destination name for {wanted}")
+
+def open_output(dst):
+    """Returns (path, file, identity, direct). With exclusive rename, write a temporary file and
+    rename it at the end. Without it, write the final file directly, so nothing is ever replaced."""
+    if has_excl_rename(dst.parent):
+        part, fo, ident = create_temp(dst)
+        return part, fo, ident, False
+    path, fo, ident = create_final(dst)
+    return path, fo, ident, True
+
 def publish(part, dst):
-    """Rename part to dst without ever replacing a file this run did not create.
-    Raises FileExistsError if dst is taken."""
-    if _libc.renamex_np(os.fsencode(part), os.fsencode(dst), RENAME_EXCL) == 0:
-        return
-    err = ctypes.get_errno()
-    if err not in (errno.ENOTSUP, errno.EINVAL):
+    """Rename part to dst, failing with FileExistsError instead of replacing an existing file."""
+    if _libc.renamex_np(os.fsencode(part), os.fsencode(dst), RENAME_EXCL) != 0:
+        err = ctypes.get_errno()
         raise OSError(err, os.strerror(err), str(dst))
-    # exFAT and some network mounts lack exclusive rename: claim the name exclusively,
-    # then replace only that empty claim
-    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666)
-    st = os.fstat(fd)
-    os.close(fd)
-    claim = (st.st_dev, st.st_ino)
-    try:
-        cur = os.lstat(dst)
-        if (cur.st_dev, cur.st_ino, cur.st_size) != (*claim, 0):
-            raise IOError(f"destination changed while finishing: {dst}")
-        os.replace(part, dst)
-    except BaseException:
-        drop_temp(dst, claim)
-        raise
 
 def finish(part, dst):
     """Publish part under dst or, if that name is taken, the next free ' (n)' name. Returns the final path."""
@@ -291,7 +318,7 @@ def copy_verified(job, src, dst, root, manifests):
                                    "sha256": src_sha, "status": "identical-already-present-verified"})
                 return
         dst = unique(dst)
-    part, fo, ident = create_temp(dst)
+    part, fo, ident, direct = open_output(dst)
     h = hashlib.sha256()
     try:
         with open(src, "rb") as fi, fo:
@@ -306,7 +333,7 @@ def copy_verified(job, src, dst, root, manifests):
             raise IOError(f"source changed during copy: {src}")
         if part.stat().st_size != st0.st_size or hash_nocache(part) != h.hexdigest():
             raise IOError(f"verification failed: {src}")
-        dst = finish(part, dst)
+        dst = part if direct else finish(part, dst)
     except BaseException:
         drop_temp(part, ident)
         raise
@@ -348,7 +375,7 @@ def pack_job(job, src, dest, root, inv, manifests, compress=True):
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest = unique(dest)
     check_dest(dest, root)
-    part, out, ident = create_temp(dest)
+    part, out, ident, direct = open_output(dest)
     expected, total = {}, 0
     entries = [src] + [src / rel for rel in inv if rel != "."]
     try:
@@ -387,7 +414,7 @@ def pack_job(job, src, dest, root, inv, manifests, compress=True):
             reader.close()
         if seen != expected:
             raise IOError(f"archive verification failed: {src}")
-        dest = finish(part, dest)
+        dest = part if direct else finish(part, dest)
     except BaseException:
         drop_temp(part, ident)
         raise
@@ -483,12 +510,16 @@ def _remove(p, is_dir, inside_job):
             os.chmod(os.path.dirname(p), 0o700)
         rm(p)
 
-def _differs_ignoring_ctime(now, recorded):
-    """Compare an entry without its ctime: deleting one name of a hard-linked file changes the
-    other name's ctime, and why_keep() already compared ctime just before deletion."""
-    return now[:4] + now[5:] != list(recorded[:4]) + list(recorded[5:])
+def _still_verified(p, recorded, hashes):
+    now = _entry(p, os.lstat(p))
+    if now == list(recorded):
+        return True
+    # Deleting one name of a hard-linked file changes the other name's ctime. Accept a
+    # ctime-only difference only if the content still has the verified hash.
+    same_but_ctime = now[:4] + now[5:] == list(recorded[:4]) + list(recorded[5:])
+    return same_but_ctime and now[0] == "f" and hash_file(p) == hashes.get(str(p))
 
-def remove_recorded(src, inv):
+def remove_recorded(src, inv, hashes):
     """Delete only entries recorded in inv, each re-checked just before removal.
     Folders are removed only when empty, so anything new survives. Returns what was left."""
     if "." in inv:
@@ -501,7 +532,7 @@ def remove_recorded(src, inv):
         try:
             if rel is None or inv[rel][0] == "d":
                 _remove(p, True, rel is not None)
-            elif _differs_ignoring_ctime(_entry(p, os.lstat(p)), inv[rel]):
+            elif not _still_verified(p, inv[rel], hashes):
                 left.append(f"{rel}: changed")
             else:
                 _remove(p, False, rel != ".")
@@ -530,7 +561,7 @@ def run_delete_phase(manifests):
         else:
             reason = why_keep(src, r["inventory"], hashes)
         if reason is None:
-            left = remove_recorded(src, r["inventory"])
+            left = remove_recorded(src, r["inventory"], hashes)
             record(manifests, {"job": job, "status": "source-partly-deleted" if left else "source-deleted",
                                "left": left})
             if left:
