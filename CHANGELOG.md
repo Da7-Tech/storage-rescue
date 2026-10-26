@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add Windows OS routing and an instruction-only PowerShell workflow for surveys, approved cleanup, Recycle Bin handling, and verified external-drive offloading.
+- Document Windows filesystem metadata, cloud placeholders, active tool caches, and Docker/WSL storage safeguards while preserving the existing macOS workflow.
+
 ## 1.0.0 (2026-10-07)
 
 First public release.
