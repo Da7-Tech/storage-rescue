@@ -1,6 +1,6 @@
 ---
 name: storage-rescue
-description: Free up storage on a Mac without losing data. Two modes - Offload (move files to an external drive, verified by checksum, then delete them from the Mac) and Reclaim (no drive; delete caches and things the user does not need). The agent asks the user before every move or deletion. Use when the user says the disk is full, wants to free space, asks what "System Data" is, wants to archive old projects, movies, models or backups to an external or NTFS drive, or wants a safe cleanup. macOS only.
+description: Safely free storage on Windows or macOS through measured cleanup or checksum-verified offloading to an external drive. Use for a full disk, large system storage, caches, old projects, models, media or backups. The agent asks before moving or deleting data.
 license: MIT
 metadata:
   author: Da7-Tech
@@ -8,6 +8,18 @@ metadata:
 ---
 
 # Storage Rescue
+
+## Choose the operating system first
+
+Determine the operating system of the filesystem being cleaned before running commands.
+
+- **Windows:** read [references/windows.md](references/windows.md) in full and follow its complete workflow instead of the macOS workflow and reference files below. It covers native PowerShell, Recycle Bin handling, cloud placeholders, NTFS metadata, WSL/Docker disks, and verified offloading. Git Bash or WSL does not make a Windows volume a macOS filesystem.
+- **macOS:** follow the original workflow below and its linked references.
+- **Other operating systems:** report that the skill has no platform-specific cleanup procedure and stop before mutations.
+
+Both platforms require a read-only survey, explicit approval for each cleanup category and personal item, and verification before deleting an offloaded source. Installing the skill does not authorize a cleanup.
+
+## macOS workflow
 
 Free space on a Mac while guaranteeing that nothing the user still needs is lost. Two modes:
 
